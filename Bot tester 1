@@ -321,3 +321,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"An error occurred during bot execution: {e}")
 https://discord.com/oauth2/authorize?client_id=1424923669125267556&permissions=11270&integration_type=0&scope=bot
+# The script looks for variables defined on the server:
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
