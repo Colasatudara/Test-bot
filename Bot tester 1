@@ -1,0 +1,323 @@
+import os
+import discord
+import json
+import requests
+import asyncio
+from discord.ext import commands
+
+# --- CONFIGURATION ---
+# IMPORTANT: Replace these placeholders with your actual keys and tokens.
+# Or, set them as environment variables (recommended for security).
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
+GEMINI_MODEL_NAME = "gemini-2.5-flash-preview-05-20"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
+VERSION = "1.1" # Bot Version
+
+# --- BOT SETUP ---
+# Enable necessary intents. MEMBERS intent is crucial for moderation commands (kick/ban)
+# and MESSAGE_CONTENT is crucial for reading user messages for the AI chat.
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True 
+intents.messages = True
+intents.guilds = True
+
+# Initialize the Bot with a command prefix (e.g., '!')
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Dictionary to store chat history sessions for each user (for AI chat)
+user_chat_history = {} 
+
+SYSTEM_INSTRUCTION = (
+    "You are Doggy Manager, a helpful and strict AI Discord bot powered by Google Gemini. "
+    "You assist server admins with information and are trained to understand and respect "
+    "server rules. Keep your general responses concise and friendly. Use Google Search "
+    "for up-to-date information when needed. Maintain a formal, yet friendly British accent."
+)
+
+# --- HELPER FUNCTION FOR GEMINI API CALL (UNCHANGED) ---
+
+async def generate_gemini_response(user_id, prompt):
+    """
+    Sends the user's prompt and conversation history to the Gemini API
+     and returns the generated text. Includes exponential backoff.
+    """
+    
+    if user_id not in user_chat_history:
+        user_chat_history[user_id] = []
+        
+    user_chat_history[user_id].append({"role": "user", "parts": [{"text": prompt}]})
+
+    payload = {
+        "contents": user_chat_history[user_id],
+        "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+        "tools": [{"google_search": {}}]
+    }
+
+    headers = {'Content-Type': 'application/json'}
+    
+    max_retries = 5
+    delay = 1  
+    response = None
+
+    for attempt in range(max_retries):
+        try:
+            response = await bot.loop.run_in_executor(
+                None, 
+                lambda: requests.post(API_URL, headers=headers, data=json.dumps(payload))
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            candidate = result.get('candidates', [{}])[0]
+            
+            if not candidate:
+                user_chat_history[user_id].pop() 
+                return "Error: AI returned an empty response candidate."
+
+            generated_text = candidate.get('content', {}).get('parts', [{}])[0].get('text', 'No text returned.')
+
+            user_chat_history[user_id].append({"role": "model", "parts": [{"text": generated_text}]})
+            
+            return generated_text
+
+        except requests.exceptions.RequestException as e:
+            if response is not None and response.status_code == 429:
+                await asyncio.sleep(delay)
+                delay *= 2  
+            elif attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                print(f"Fatal API Error after {max_retries} attempts: {e}")
+                user_chat_history[user_id].pop() 
+                return "Sorry, I'm currently unable to connect to the AI service. Please try again later."
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            user_chat_history[user_id].pop() 
+            return "An internal error occurred while processing your request."
+
+# --- DISCORD BOT EVENTS ---
+
+@bot.event
+async def on_ready():
+    """Prints status message when the bot is ready."""
+    print(f'--- Doggy Manager Logged in as {bot.user} ({bot.user.id}) ---')
+    print(f'Bot Version: {VERSION} is ready.')
+    await bot.change_presence(activity=discord.Game(name=f"!help | v{VERSION}"))
+
+# --- NEW EVENTS: GREETINGS AND GOODBYES ---
+
+def get_general_channel(guild):
+    """A helper function to find the first text channel the bot can send messages to."""
+    for channel in guild.text_channels:
+        if channel.permissions_for(guild.me).send_messages:
+            return channel
+    return None
+
+@bot.event
+async def on_member_join(member):
+    """Sends a warm British welcome when a new member joins."""
+    channel = get_general_channel(member.guild)
+    if channel:
+        welcome_message = (
+            f"**Right then, a hearty welcome to {member.mention}!**\n"
+            f"Do give the rules a quick read. I'm **Doggy Manager**, here to help and keep things shipshape. "
+            f"Try `!help` to see what I can do!"
+        )
+        await channel.send(welcome_message)
+
+@bot.event
+async def on_member_remove(member):
+    """Announces when a member has left the server."""
+    channel = get_general_channel(member.guild)
+    if channel:
+        goodbye_message = (
+            f"Cheerio, then. **{member.display_name}** has departed the premises. "
+            f"Pity, that. Back to keeping things shipshape!"
+        )
+        await channel.send(goodbye_message)
+
+# --- NEW UTILITY COMMANDS ---
+
+@bot.command(name='help', help='Displays a list of all commands and features.')
+async def custom_help(ctx):
+    """Sends a well-formatted embed listing all bot commands and features."""
+    embed = discord.Embed(
+        title="🇬🇧 Doggy Manager Command Dossier",
+        description=f"Cheerio! I'm here to manage and chat. Current Version: **{VERSION}**",
+        color=discord.Color.gold()
+    )
+
+    embed.add_field(name="🧠 AI Chat Assistant", 
+                    value="Mention me (`@Doggy Manager`) with any query for a jolly good chinwag!", 
+                    inline=False)
+
+    embed.add_field(name="🚨 Moderation Directives", 
+                    value="Admin-only tools to keep things shipshape:", 
+                    inline=False)
+    
+    embed.add_field(name="`!kick @user [reason]`", value="Kicks a troublesome chap.", inline=True)
+    embed.add_field(name="`!ban @user [reason]`", value="Bans a user outright.", inline=True)
+    embed.add_field(name="`!warn @user [reason]`", value="Sends a formal caution (DM).", inline=True)
+    
+    embed.add_field(name="⚙️ General Utilities", 
+                    value="Essential tools for the Manager and the chat:", 
+                    inline=False)
+    embed.add_field(name="`!help`", value="Displays this magnificent dossier.", inline=True)
+    embed.add_field(name="`!reset`", value="Clears our conversation history.", inline=True)
+
+    embed.set_footer(text=f"Scripted by Gemini AI | Version {VERSION}")
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='reset', help='Clears your AI chat history with Doggy Manager.')
+async def reset_chat(ctx):
+    """Resets the chat history for the user."""
+    user_id = ctx.author.id
+    if user_id in user_chat_history:
+        del user_chat_history[user_id]
+        await ctx.send("📝 **Right, consider that chinwag history reset!** We're starting afresh.")
+    else:
+        await ctx.send("My word, you haven't even started chatting with me yet!")
+
+
+# --- MODERATION COMMANDS (UNCHANGED) ---
+
+@bot.command(name='kick', help='Kicks a member from the server.')
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason: str = "No reason provided."):
+    """Kicks a member and logs the action."""
+    try:
+        await member.kick(reason=reason)
+        await ctx.send(f'🦴 **Kicked {member.mention}** for reason: *{reason}*')
+    except discord.Forbidden:
+        await ctx.send("🚨 I don't have permission to kick that user. My role might be below theirs.")
+    except discord.HTTPException:
+        await ctx.send("❌ Failed to kick the user due to a Discord API error.")
+    except Exception as e:
+        await ctx.send(f"An unexpected error occurred: {e}")
+
+@kick.error
+async def kick_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("🛑 **Permission Denied!** You must have the `Kick Members` permission to use this command.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Usage: `!kick <@member> [reason]`")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Member not found. Please mention the member (e.g., `!kick @DoggyUser`).")
+    else:
+        print(f"Kick Error: {error}")
+
+@bot.command(name='ban', help='Bans a user from the server.')
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, user: discord.User, *, reason: str = "No reason provided."):
+    """Bans a user (by ID or mention) and logs the action."""
+    try:
+        await ctx.guild.ban(user, reason=reason, delete_message_days=0)
+        await ctx.send(f'🚫 **Banned {user.mention}** for reason: *{reason}*')
+    except discord.Forbidden:
+        await ctx.send("🚨 I don't have permission to ban that user. My role might be below theirs.")
+    except discord.HTTPException:
+        await ctx.send("❌ Failed to ban the user due to a Discord API error.")
+    except Exception as e:
+        await ctx.send(f"An unexpected error occurred: {e}")
+
+@ban.error
+async def ban_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("🛑 **Permission Denied!** You must have the `Ban Members` permission to use this command.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Usage: `!ban <@user|user_id> [reason]`")
+    elif isinstance(error, commands.UserNotFound):
+        await ctx.send("❌ User not found. Please mention the user or provide a valid ID.")
+    else:
+        print(f"Ban Error: {error}")
+
+
+@bot.command(name='warn', help='Sends a warning to a member.')
+@commands.has_permissions(manage_guild=True)
+async def warn(ctx, member: discord.Member, *, reason: str = "Violation of server rules."):
+    """Sends a warning message to the user via DM and logs it in the channel."""
+    
+    warning_message = (
+        f"🚨 **You have been officially warned in {ctx.guild.name}.**\n"
+        f"Reason: *{reason}*\n"
+        "Please review the server rules to avoid further action."
+    )
+    try:
+        await member.send(warning_message)
+        dm_success = True
+    except discord.Forbidden:
+        dm_success = False
+
+    log_message = f"⚠️ **WARNING:** {member.mention} was warned by {ctx.author.mention}."
+    if not dm_success:
+        log_message += " (Could not DM user - DMs blocked.)"
+    
+    await ctx.send(f'{log_message}\n> Reason: *{reason}*')
+
+@warn.error
+async def warn_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("🛑 **Permission Denied!** You must have the `Manage Server` permission to issue warnings.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Usage: `!warn <@member> [reason]`")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Member not found. Please mention the member (e.g., `!warn @DoggyUser`).")
+    else:
+        print(f"Warn Error: {error}")
+
+
+# --- AI CHAT RESPONSE LOGIC (UNCHANGED) ---
+
+@bot.event
+async def on_message(message):
+    """Handles incoming messages and routes them to the AI or commands."""
+    
+    if message.author == bot.user:
+        return
+
+    await bot.process_commands(message)
+
+    is_reply_to_bot = (
+        message.reference and 
+        message.reference.resolved and 
+        message.reference.resolved.author == bot.user
+    )
+    mentions_bot = bot.user in message.mentions
+
+    if mentions_bot or is_reply_to_bot:
+        
+        prompt = message.clean_content
+        
+        if mentions_bot:
+            mention_string = bot.user.mention.replace('<@!', '<@') 
+            if prompt.startswith(mention_string):
+                prompt = prompt[len(mention_string):].strip()
+
+        if not prompt:
+            await message.channel.send("Woof! What's up, Manager? I can answer questions or you can use `!kick`, `!ban`, `!warn`.")
+            return
+
+        async with message.channel.typing():
+            user_id = message.author.id
+            response_text = await generate_gemini_response(user_id, prompt)
+            
+            await message.reply(response_text)
+
+# --- RUN BOT ---
+if __name__ == "__main__":
+    if "YOUR_DISCORD_BOT_TOKEN_HERE" in DISCORD_TOKEN or "YOUR_GEMINI_API_KEY_HERE" in GEMINI_API_KEY:
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!! WARNING: Replace the placeholder tokens/keys. Bot will not run.      !!")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    
+    try:
+        bot.run(DISCORD_TOKEN)
+    except discord.LoginFailure:
+        print("ERROR: Failed to log in. Please check your DISCORD_TOKEN.")
+    except Exception as e:
+        print(f"An error occurred during bot execution: {e}")
+https://discord.com/oauth2/authorize?client_id=1424923669125267556&permissions=11270&integration_type=0&scope=bot
