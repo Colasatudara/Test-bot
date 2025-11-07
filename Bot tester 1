@@ -12,11 +12,13 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 GEMINI_MODEL_NAME = "gemini-2.5-flash-preview-05-20"
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
-VERSION = "1.1" # Bot Version
+VERSION = "1.2" # Bot Version
+
+# Configuration file path for reaction roles and persistent data
+CONFIG_FILE = "bot_config.json"
 
 # --- BOT SETUP ---
-# Enable necessary intents. MEMBERS intent is crucial for moderation commands (kick/ban)
-# and MESSAGE_CONTENT is crucial for reading user messages for the AI chat.
+# Enable necessary intents. MEMBERS is crucial for moderation and role reactions.
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True 
@@ -28,6 +30,9 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Dictionary to store chat history sessions for each user (for AI chat)
 user_chat_history = {} 
+# Dictionary to store reaction role configuration (persistent data)
+# Structure: {message_id: {'channel_id': id, 'guild_id': id, 'mappings': {'emoji_name_or_id': role_id}}}
+reaction_role_configs = {} 
 
 SYSTEM_INSTRUCTION = (
     "You are Doggy Manager, a helpful and strict AI Discord bot powered by Google Gemini. "
@@ -36,6 +41,31 @@ SYSTEM_INSTRUCTION = (
     "for up-to-date information when needed. Maintain a formal, yet friendly British accent."
 )
 
+# --- HELPER FUNCTIONS FOR PERSISTENCE (JSON SIMULATION) ---
+
+def load_data():
+    """Loads configuration data from the JSON file."""
+    global reaction_role_configs
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            data = json.load(f)
+            reaction_role_configs = data.get('reaction_roles', {})
+            print(f"Loaded {len(reaction_role_configs)} reaction role configurations.")
+    except FileNotFoundError:
+        print(f"Config file '{CONFIG_FILE}' not found. Starting fresh.")
+    except json.JSONDecodeError:
+        print(f"Error reading '{CONFIG_FILE}'. Starting fresh.")
+
+def save_data():
+    """Saves configuration data to the JSON file."""
+    try:
+        data = {'reaction_roles': reaction_role_configs}
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+        print("Configuration data saved successfully.")
+    except Exception as e:
+        print(f"Error saving data to JSON file: {e}")
+
 # --- HELPER FUNCTION FOR GEMINI API CALL (UNCHANGED) ---
 
 async def generate_gemini_response(user_id, prompt):
@@ -43,6 +73,8 @@ async def generate_gemini_response(user_id, prompt):
     Sends the user's prompt and conversation history to the Gemini API
      and returns the generated text. Includes exponential backoff.
     """
+    # NOTE: Implementation details remain the same as v1.1 for brevity in this update.
+    # The full logic for API call and error handling is included in the complete script.
     
     if user_id not in user_chat_history:
         user_chat_history[user_id] = []
@@ -102,12 +134,12 @@ async def generate_gemini_response(user_id, prompt):
 
 @bot.event
 async def on_ready():
-    """Prints status message when the bot is ready."""
+    """Prints status message and loads config when the bot is ready."""
+    load_data() # Load persistent data on startup
     print(f'--- Doggy Manager Logged in as {bot.user} ({bot.user.id}) ---')
     print(f'Bot Version: {VERSION} is ready.')
     await bot.change_presence(activity=discord.Game(name=f"!help | v{VERSION}"))
 
-# --- NEW EVENTS: GREETINGS AND GOODBYES ---
 
 def get_general_channel(guild):
     """A helper function to find the first text channel the bot can send messages to."""
@@ -139,7 +171,110 @@ async def on_member_remove(member):
         )
         await channel.send(goodbye_message)
 
-# --- NEW UTILITY COMMANDS ---
+
+# --- NEW: REACTION ROLE LOGIC ---
+
+@bot.command(name='set_reaction_role', help='Sets up an emoji reaction to grant a specific role.')
+@commands.has_permissions(manage_roles=True)
+async def set_reaction_role(ctx, message_id: int, emoji, role: discord.Role):
+    """Sets up an emoji reaction to grant a specific role."""
+    try:
+        message = await ctx.fetch_message(message_id)
+        if not message:
+            return await ctx.send("❌ I couldn't find a message with that ID in this channel.")
+
+        # Add the initial reaction to the message
+        await message.add_reaction(emoji)
+        
+        # Determine the key for the emoji (Unicode or custom emoji ID)
+        emoji_key = str(emoji)
+
+        # Update the global config dictionary
+        if message_id not in reaction_role_configs:
+            reaction_role_configs[message_id] = {
+                'channel_id': ctx.channel.id,
+                'guild_id': ctx.guild.id,
+                'mappings': {}
+            }
+        
+        reaction_role_configs[message_id]['mappings'][emoji_key] = role.id
+        
+        save_data()
+
+        await ctx.send(f"✅ **Reaction Role Set!** Reacting with {emoji} on that message will now grant the **{role.name}** role.")
+
+    except commands.MissingRequiredArgument:
+        await ctx.send("Usage: `!set_reaction_role <message_id> <emoji> @role`")
+    except commands.MissingPermissions:
+        await ctx.send("🛑 **Permission Denied!** You must have the `Manage Roles` permission.")
+    except Exception as e:
+        print(f"Reaction Role Setup Error: {e}")
+        await ctx.send(f"An error occurred while setting up the role reaction. Ensure the emoji and role are correct.")
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    """Handles role assignment when a user adds a reaction."""
+    if payload.user_id == bot.user.id or payload.message_id not in reaction_role_configs:
+        return
+
+    # 1. Get necessary data from payload
+    guild = bot.get_guild(payload.guild_id)
+    if not guild: return
+    member = guild.get_member(payload.user_id)
+    if not member: return
+
+    # 2. Get emoji key
+    emoji_key = str(payload.emoji)
+    
+    # 3. Check config for mapping
+    config = reaction_role_configs.get(payload.message_id, {})
+    role_id = config.get('mappings', {}).get(emoji_key)
+
+    # 4. Assign role if found
+    if role_id:
+        role = guild.get_role(role_id)
+        if role and role not in member.roles:
+            try:
+                # Bot must have permission and role must be below bot's highest role
+                await member.add_roles(role, reason="Reaction Role Assignment")
+            except discord.Forbidden:
+                print(f"Bot lacks permissions to add role {role.name} to {member.name}.")
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    """Handles role removal when a user removes a reaction."""
+    if payload.user_id == bot.user.id or payload.message_id not in reaction_role_configs:
+        return
+
+    # 1. Get necessary data from payload
+    guild = bot.get_guild(payload.guild_id)
+    if not guild: return
+    
+    # We must fetch the member from the guild since on_raw_reaction_remove payload lacks the full member object
+    member = guild.get_member(payload.user_id) 
+    if not member: 
+        # Member may have left the server, or Discord cache is slow
+        return 
+
+    # 2. Get emoji key
+    emoji_key = str(payload.emoji)
+    
+    # 3. Check config for mapping
+    config = reaction_role_configs.get(payload.message_id, {})
+    role_id = config.get('mappings', {}).get(emoji_key)
+
+    # 4. Remove role if found
+    if role_id:
+        role = guild.get_role(role_id)
+        if role and role in member.roles:
+            try:
+                # Bot must have permission and role must be below bot's highest role
+                await member.remove_roles(role, reason="Reaction Role Removal")
+            except discord.Forbidden:
+                print(f"Bot lacks permissions to remove role {role.name} from {member.name}.")
+
+
+# --- UTILITY COMMANDS (UPDATED HELP) ---
 
 @bot.command(name='help', help='Displays a list of all commands and features.')
 async def custom_help(ctx):
@@ -162,6 +297,12 @@ async def custom_help(ctx):
     embed.add_field(name="`!ban @user [reason]`", value="Bans a user outright.", inline=True)
     embed.add_field(name="`!warn @user [reason]`", value="Sends a formal caution (DM).", inline=True)
     
+    embed.add_field(name="✨ **NEW: Reaction Roles (v1.2)**", 
+                    value="Set up self-assignable roles. Requires **Manage Roles** permission.", 
+                    inline=False)
+    embed.add_field(name="`!set_reaction_role <msg_id> <emoji> @role`", value="Links an emoji reaction on a specific message to a role.", inline=False)
+
+
     embed.add_field(name="⚙️ General Utilities", 
                     value="Essential tools for the Manager and the chat:", 
                     inline=False)
@@ -320,7 +461,3 @@ if __name__ == "__main__":
         print("ERROR: Failed to log in. Please check your DISCORD_TOKEN.")
     except Exception as e:
         print(f"An error occurred during bot execution: {e}")
-https://discord.com/oauth2/authorize?client_id=1424923669125267556&permissions=11270&integration_type=0&scope=bot
-# The script looks for variables defined on the server:
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
